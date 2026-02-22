@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Wallet files (private keys — NEVER commit these!)
+*.pem
+
+# OS
+.DS_Store
+
+# PyTest cache
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
