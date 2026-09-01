@@ -20,6 +20,8 @@
 11. [The Node — Putting It All Together](#11-the-node--putting-it-all-together)
 12. [Running It Yourself](#12-running-it-yourself)
 13. [Full Supply Chain Flow Summary](#13-full-supply-chain-flow-summary)
+14. [Custody — Why Signatures Aren't Enough](#14-custody--why-signatures-arent-enough)
+15. [Persistence — Surviving a Restart](#15-persistence--surviving-a-restart)
 
 ---
 
@@ -207,6 +209,11 @@ print(tx.is_valid()) # True — signature checks out
 - ✅ stage must be one of the 4 valid stages
 - ✅ signature must match sender's public key
 
+⚠️ These four rules check that a transaction is **well-formed and authorised**.
+They do *not* check that the sender actually **had** the oil — that is a separate
+layer, and it is the most important one in this whole project.
+See [14. Custody — Why Signatures Aren't Enough](#14-custody--why-signatures-arent-enough).
+
 ---
 
 ## 6. Blocks — Bundling Transactions Together
@@ -237,8 +244,16 @@ class Block:
 ```python
 # Genesis = the very first block, created when the blockchain starts
 # It has no previous block, so previous_hash = "000...0" (64 zeros)
-# It has no transactions
+# It carries no transfers — only the PRODUCER REGISTRY: the list of wallets
+# allowed to bring new petroleum into existence.
 ```
+
+Putting the registry *inside* genesis is deliberate. It means the list is covered
+by the genesis Merkle root and therefore by the genesis hash, so:
+- it cannot be edited without changing the genesis hash and breaking the chain,
+- it travels with the chain automatically when a new node syncs,
+- two nodes given different producer lists get different genesis hashes and
+  simply refuse to talk to each other.
 
 ---
 
@@ -611,3 +626,128 @@ curl -X POST http://localhost:8000/mine
 
 *Made with ❤️ for CSL7490 – Intro to Blockchain*  
 *Every concept here is implemented in the code — go read it!*
+
+
+---
+
+## 14. Custody — Why Signatures Aren't Enough
+
+This is the most important idea in the project, and the one most from-scratch
+blockchain tutorials skip entirely.
+
+### The problem
+
+Imagine every rule from section 5 is satisfied. The transaction is well-formed.
+The signature verifies perfectly against the sender's public key. Proof-of-Work
+was done honestly. The block hash is valid.
+
+**And the shipment is still completely fraudulent.**
+
+```
+Producer ships 10,000 L to Refinery A   ← signed, valid ✅
+Producer ships THE SAME 10,000 L to B   ← also signed, also "valid" ✅
+```
+
+A signature proves *who authorised* a shipment. It says nothing about whether
+that petroleum **existed** or whether the sender **had** it. Without another
+layer, our ledger permits:
+
+| Attack | Result |
+|---|---|
+| **Double-spend** | The same barrels sold twice |
+| **Supply inflation** | Any new wallet invents 999,999,999 L from nothing |
+| **Phantom stock** | A refinery that got 10,000 L ships out 500,000 L |
+
+This is precisely the problem Bitcoin solves with the **UTXO set** — and it is
+the reason a blockchain is more than a signed, append-only log.
+
+### The solution: a derived custody ledger
+
+`ledger.py` maintains **who is holding how much of what**:
+
+```python
+balances = {
+    refinery_address:    {"crude_oil": 1500.0},
+    distributor_address: {"petrol":    4500.0},
+}
+```
+
+The critical design decision: **these balances are never stored on the chain.**
+They are *recomputed* by replaying every confirmed block from genesis. That means:
+
+- Every node independently derives **identical** state from the same blocks.
+- There is no separate "balance database" that could drift out of sync or be
+  tampered with independently of the chain.
+- Restoring a node from disk re-derives balances from scratch — nothing to trust.
+
+### The rules
+
+```
+PRODUCTION    Oil ENTERS the system (minting).
+              → sender MUST be in the genesis producer registry.
+              → credits the receiver.
+
+REFINERY      A CONVERSION, not a transfer.
+              → burns crude_oil from the refinery's own inventory,
+              → credits the receiver with refined product,
+              → output can never exceed the crude consumed.
+
+DISTRIBUTION  A pure transfer.
+RETAIL        → sender must ALREADY hold that exact commodity, in that amount.
+```
+
+### Where it is enforced
+
+Custody is checked in **four** places, because an attacker can enter at any of them:
+
+1. **Mempool admission** — against confirmed state *plus everything already
+   queued*, so two conflicting shipments can't both sit waiting to be mined.
+2. **Mining** — transactions that no longer apply are evicted rather than mined
+   into an invalid block.
+3. **Incoming peer blocks** — Proof-of-Work proves effort was spent, **never**
+   that contents are legitimate. Every block from the network is re-validated
+   for signatures *and* custody before it is appended.
+4. **Full chain validation** — the entire chain is replayed, so a tampered or
+   forged history fails even if every individual signature checks out.
+
+Point 3 is the one worth remembering in an interview. `demo.py` mines a
+**genuinely valid Proof-of-Work block** containing a fraudulent shipment and
+gossips it over the real P2P network — and the network rejects it:
+
+```
+▶ Rogue node mines a VALID-PoW block containing 50,000 L
+  it never received, and gossips it over P2P
+  → producer height 4 → 4 (REJECTED)
+```
+
+---
+
+## 15. Persistence — Surviving a Restart
+
+A node that forgets everything when you close the terminal isn't a ledger.
+
+Passing `--data-dir DIR` gives a node two files:
+
+```
+DIR/chain.json    the blockchain + mempool
+DIR/wallet.pem    this node's private key (chmod 0600)
+```
+
+Two details matter more than the file format:
+
+**Writes are atomic.** The chain is written to `chain.json.tmp` and then moved
+into place with `os.replace()`, which is atomic on POSIX. A node killed
+mid-write leaves the previous good ledger intact rather than a truncated file.
+
+**Loads are re-validated, never trusted.** `Blockchain.load()` runs the full
+validation suite — hashes, linkage, Merkle roots, Proof-of-Work, signatures and
+a complete custody replay — before the chain is accepted. Hand-edit a stored
+ledger to give yourself a million litres and the node refuses to start:
+
+```python
+>>> Blockchain.load("chain.json")
+ValueError: chain.json: stored chain failed validation
+```
+
+Balances are **not** in the file. They are re-derived from the blocks on load,
+which is exactly why a tampered file cannot smuggle in fake inventory.
