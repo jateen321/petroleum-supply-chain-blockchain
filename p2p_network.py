@@ -21,6 +21,7 @@ accepts the incoming chain only if it is longer AND valid.
 """
 
 import json
+import secrets
 import socket
 import threading
 import logging
@@ -105,6 +106,13 @@ class P2PNode:
         # known peer addresses (for handshake gossip)
         self._known_peers: Set[Tuple[str, int]] = set()
 
+        # Random per-node identifier echoed in every handshake.  A node bound to
+        # 0.0.0.0 cannot recognise its own address in a gossiped peer list, so
+        # it would happily dial itself; seeing our own nonce come back is the
+        # only reliable way to detect and drop that self-connection.
+        self.node_nonce = secrets.token_hex(8)
+        self._self_addrs: Set[Tuple[str, int]] = set()
+
         self._server_sock: Optional[socket.socket] = None
         self._running = False
 
@@ -140,13 +148,24 @@ class P2PNode:
         Initiate an outbound TCP connection to *host*:*port*.
         Returns True on success.
         """
+        # Resolve to an IP first.  Inbound connections are only ever known by
+        # their numeric address, so dialling "localhost" while accepting from
+        # "127.0.0.1" would otherwise register the same peer under two keys and
+        # leave a duplicate socket per pair.
+        try:
+            host = socket.gethostbyname(host)
+        except OSError:
+            pass    # unresolvable; fall through and let create_connection report
+
         key = (host, port)
         with self._peers_lock:
             if key in self._peers:
                 return True     # already connected
         try:
             sock = socket.create_connection((host, port), timeout=5)
-            self._register_peer(key, sock)
+            # We dialled this address, so we know it is a real listening port
+            # and it is safe to gossip onward to other peers.
+            self._register_peer(key, sock, listening=True)
             # Send our handshake immediately
             self._send_handshake(sock)
             return True
@@ -154,10 +173,23 @@ class P2PNode:
             logger.warning("Could not connect to peer %s:%d – %s", host, port, e)
             return False
 
-    def _register_peer(self, key: Tuple[str, int], sock: socket.socket) -> None:
+    def _register_peer(
+        self, key: Tuple[str, int], sock: socket.socket, listening: bool = False
+    ) -> None:
+        """
+        Track a connected peer.
+
+        *listening* marks whether `key` is the peer's real P2P listening address
+        (true for outbound dials and for inbound peers once their handshake has
+        told us their real port).  Only such addresses go into `_known_peers`,
+        because that set is gossiped to other nodes — publishing the ephemeral
+        source port of an inbound socket would send every other node dialling a
+        port nobody is listening on.
+        """
         with self._peers_lock:
             self._peers[key] = sock
-            self._known_peers.add(key)
+            if listening:
+                self._known_peers.add(key)
         # Spawn a reader thread for this peer
         t = threading.Thread(
             target=self._peer_reader, args=(key, sock), daemon=True
@@ -188,8 +220,10 @@ class P2PNode:
         while self._running:
             try:
                 client_sock, addr = self._server_sock.accept()
+                # addr[1] is the peer's ephemeral source port, not the port it
+                # listens on; the handshake corrects this shortly.
                 key = (addr[0], addr[1])
-                self._register_peer(key, client_sock)
+                self._register_peer(key, client_sock, listening=False)
             except OSError:
                 break
 
@@ -257,22 +291,33 @@ class P2PNode:
         self._send_to(
             sock,
             MSG_HANDSHAKE,
-            {"p2p_port": self.port, "known_peers": peers},
+            {"p2p_port": self.port, "nonce": self.node_nonce, "known_peers": peers},
         )
 
     def _handle_handshake(
         self, payload: dict, sender_key: Tuple[str, int], sock: socket.socket
     ) -> None:
         # Record corrected port from handshake (accept() gives ephemeral port)
+        # A handshake carrying our own nonce means we dialled ourselves.
+        if payload.get("nonce") == self.node_nonce:
+            p2p_port = payload.get("p2p_port")
+            if p2p_port:
+                self._self_addrs.add((sender_key[0], p2p_port))
+            logger.debug("Dropping self-connection from %s:%d", *sender_key)
+            self._remove_peer(sender_key)
+            return
+
         p2p_port = payload.get("p2p_port")
         if p2p_port:
             correct_key = (sender_key[0], p2p_port)
+            with self._peers_lock:
+                if correct_key != sender_key and sender_key in self._peers:
+                    self._peers[correct_key] = self._peers.pop(sender_key)
+                self._known_peers.discard(sender_key)
+                # Now verified: this is where the peer actually listens, so it
+                # may be gossiped on.
+                self._known_peers.add(correct_key)
             if correct_key != sender_key:
-                with self._peers_lock:
-                    if sender_key in self._peers:
-                        self._peers[correct_key] = self._peers.pop(sender_key)
-                    self._known_peers.discard(sender_key)
-                    self._known_peers.add(correct_key)
                 logger.debug("Corrected peer key to %s:%d", *correct_key)
 
         # Try to connect to peers we don't know yet
@@ -282,7 +327,8 @@ class P2PNode:
                 key = (h, p)
                 with self._peers_lock:
                     known = key in self._peers or key in self._known_peers
-                if not known and (h != self.host or p != self.port):
+                is_self = (h, p) in self._self_addrs or p == self.port
+                if not known and not is_self:
                     threading.Thread(
                         target=self.connect_to_peer, args=(h, p), daemon=True
                     ).start()

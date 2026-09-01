@@ -25,3 +25,8 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Node data directories (persisted ledgers + wallet keys)
+data/
+*.chain.json
+chain.json

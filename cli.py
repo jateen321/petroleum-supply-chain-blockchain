@@ -3,8 +3,13 @@ cli.py – Command-line interface for the petroleum supply chain blockchain node
 
 Usage
 -----
-  # Start a node
-  python cli.py start --p2p-port 5000 --http-port 8000 --role producer
+  # Start a node.  --authorize pins which wallets may mint new supply; it is
+  # baked into genesis, so every node in one network must be given the same set.
+  python cli.py start --p2p-port 5000 --http-port 8000 --role producer \\
+       --authorize <producer_address> --data-dir ./data/producer
+
+  # Show custody state (who is holding what, replayed from the chain)
+  python cli.py inventory --http 8000
 
   # Connect to a peer (while another terminal runs the node)
   curl -X POST http://localhost:8000/connect -H "Content-Type: application/json" \\
@@ -82,6 +87,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         role=args.role,
         difficulty=args.difficulty,
         wallet=wallet,
+        authorized_producers=args.authorize or [],
+        data_dir=args.data_dir,
     )
 
     # Connect to seed peers before starting HTTP (non-blocking P2P is already up)
@@ -91,12 +98,24 @@ def cmd_start(args: argparse.Namespace) -> None:
             print(f"[*] Connecting to peer {h}:{p} …")
             node.p2p.connect_to_peer(h, int(p))
 
+    producers = sorted(node.blockchain.authorized_producers)
     print(f"\n{'='*55}")
     print(f"  Petroleum Supply Chain Node")
     print(f"  Role     : {args.role}")
     print(f"  Address  : {node.wallet.address}")
     print(f"  P2P port : {args.p2p_port}")
     print(f"  HTTP API : http://localhost:{args.http_port}")
+    print(f"  Genesis  : {node.blockchain.chain[0].hash[:24]}…")
+    print(f"  Height   : {node.blockchain.height}")
+    if args.data_dir:
+        print(f"  Data dir : {args.data_dir}")
+    if producers:
+        print(f"  Producers authorised to mint supply:")
+        for addr in producers:
+            print(f"    • {addr}")
+    else:
+        print(f"  Producers: none authorised — PRODUCTION will be rejected.")
+        print(f"             Pass --authorize <address> on every node.")
     print(f"{'='*55}\n")
 
     node.start()   # blocks
@@ -188,6 +207,47 @@ def cmd_connect(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_inventory(args: argparse.Namespace) -> None:
+    """Show who currently holds how much of what, replayed from the chain."""
+    try:
+        path = "/inventory"
+        if args.address:
+            path += f"?address={args.address}"
+        result = http_get(args.http, path)
+    except urllib.error.URLError as e:
+        print(f"[!] Error: {e.reason}")
+        sys.exit(1)
+
+    if not result.get("success"):
+        print(f"[!] {result.get('error')}")
+        sys.exit(1)
+
+    if args.address:
+        print(f"\n  {args.address[:24]}…")
+        inv = result["inventory"]
+        if not inv:
+            print("    (holds nothing)")
+        for commodity, qty in sorted(inv.items()):
+            print(f"    {commodity:<12s} {qty:>14,.2f} L")
+        print()
+        return
+
+    balances = result["balances"]
+    producers = set(result.get("authorized_producers", []))
+    print(f"\n{'='*55}")
+    print("  Custody state (derived from confirmed blocks)")
+    print(f"{'='*55}")
+    if not balances:
+        print("\n  (no petroleum in the system yet)\n")
+        return
+    for address, inv in sorted(balances.items()):
+        tag = "  [authorised producer]" if address in producers else ""
+        print(f"\n  {address[:24]}…{tag}")
+        for commodity, qty in sorted(inv.items()):
+            print(f"    {commodity:<12s} {qty:>14,.2f} L")
+    print()
+
+
 def cmd_mempool(args: argparse.Namespace) -> None:
     """Show unconfirmed transactions."""
     try:
@@ -221,6 +281,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Seed peer to connect on startup (repeatable)")
     sp.add_argument("--wallet-file", metavar="FILE",
                     help="Path to PEM wallet file (created if missing)")
+    sp.add_argument("--authorize", action="append", metavar="ADDRESS",
+                    help="Wallet address permitted to mint new supply "
+                         "(repeatable). Baked into genesis, so EVERY node in "
+                         "the network must be given the same set or their "
+                         "genesis hashes differ and they will not sync.")
+    sp.add_argument("--data-dir", metavar="DIR",
+                    help="Directory to persist the ledger and wallet key, so "
+                         "the node survives a restart with its history intact")
 
     # ── tx ─────────────────────────────────────────────────────────────
     sp = sub.add_parser("tx", help="Submit a supply chain transaction")
@@ -258,6 +326,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("mempool", help="Show unconfirmed transactions")
     sp.add_argument("--http", type=int, default=8000)
 
+    # ── inventory ──────────────────────────────────────────────────────
+    sp = sub.add_parser("inventory",
+                        help="Show custody state (who holds what) from the chain")
+    sp.add_argument("--http", type=int, default=8000)
+    sp.add_argument("--address", help="Show only this address's holdings")
+
     return parser
 
 
@@ -278,6 +352,7 @@ def main() -> None:
         "peers":   cmd_peers,
         "connect": cmd_connect,
         "mempool": cmd_mempool,
+        "inventory": cmd_inventory,
     }
     dispatch[args.command](args)
 

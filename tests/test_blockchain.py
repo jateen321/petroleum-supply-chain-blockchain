@@ -1,6 +1,7 @@
 """tests/test_blockchain.py – Unit tests for Block and Blockchain."""
 import sys
 import os
+import json
 import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -18,9 +19,14 @@ def wallets():
 
 
 @pytest.fixture
-def bc():
-    """Fresh blockchain with difficulty=2 (fast mining in tests)."""
-    return Blockchain(difficulty=2)
+def bc(wallets):
+    """
+    Fresh blockchain with difficulty=2 (fast mining in tests).
+
+    wallets[0] is registered as an authorised producer, so it may mint new
+    supply; every other address must be backed by custody it actually received.
+    """
+    return Blockchain(difficulty=2, authorized_producers=[wallets[0].address])
 
 
 @pytest.fixture
@@ -63,12 +69,15 @@ class TestBlock:
 # ── Blockchain tests ──────────────────────────────────────────────────────────
 
 class TestBlockchain:
-    def test_genesis_block(self, bc):
+    def test_genesis_block(self, bc, wallets):
         assert len(bc.chain) == 1
         genesis = bc.chain[0]
         assert genesis.index == 0
         assert genesis.previous_hash == "0" * 64
-        assert genesis.transactions == []
+        # Genesis carries no transfers, only the producer registry it pins.
+        assert len(genesis.transactions) == 1
+        assert genesis.transactions[0]["type"] == "PRODUCER_REGISTRY"
+        assert bc.authorized_producers == {wallets[0].address}
 
     def test_genesis_valid(self, bc):
         assert bc.is_chain_valid()
@@ -108,11 +117,17 @@ class TestBlockchain:
         assert bc.is_chain_valid()
 
     def test_chain_valid_after_multiple_blocks(self, bc, wallets):
-        sender, receiver = wallets
-        for i in range(3):
-            tx = create_transaction(sender, receiver.address, "diesel", 100 + i, "DISTRIBUTION")
+        producer, refinery = wallets
+        # Mint crude to the refinery, then refine it out over further blocks.
+        bc.add_transaction(
+            create_transaction(producer, refinery.address, "crude_oil", 900, "PRODUCTION")
+        )
+        bc.mine_pending_transactions(producer.address)
+        for i in range(2):
+            buyer = Wallet()
+            tx = create_transaction(refinery, buyer.address, "petrol", 100 + i, "REFINERY")
             bc.add_transaction(tx)
-            bc.mine_pending_transactions(sender.address)
+            bc.mine_pending_transactions(producer.address)
         assert bc.is_chain_valid()
         assert bc.height == 3
 
@@ -129,14 +144,17 @@ class TestBlockchain:
         bc.chain[1].hash = "0" * 64   # corrupt hash
         assert not bc.is_chain_valid()
 
-    def test_replace_chain_accepts_longer(self, bc, signed_tx, wallets):
-        """A longer valid chain should replace the shorter local chain."""
-        # Build a longer blockchain
-        longer = Blockchain(difficulty=2)
+    def test_replace_chain_accepts_longer(self, bc, wallets):
+        """A longer valid chain sharing our genesis should replace ours."""
+        producer, receiver = wallets
+        # Same producer registry => same genesis hash => same network.
+        longer = Blockchain(difficulty=2, authorized_producers=[producer.address])
         for i in range(2):
-            tx = create_transaction(wallets[0], wallets[1].address, "LPG", 50 + i, "RETAIL")
+            tx = create_transaction(
+                producer, receiver.address, "crude_oil", 50 + i, "PRODUCTION"
+            )
             longer.add_transaction(tx)
-            longer.mine_pending_transactions(wallets[0].address)
+            longer.mine_pending_transactions(producer.address)
 
         # bc (height=0) should accept longer (height=2)
         replaced = bc.replace_chain([b.to_dict() for b in longer.chain])
@@ -147,10 +165,70 @@ class TestBlockchain:
         bc.add_transaction(signed_tx)
         bc.mine_pending_transactions(wallets[0].address)
         # Try to replace with just genesis
-        short = Blockchain(difficulty=2)
+        short = Blockchain(difficulty=2, authorized_producers=[wallets[0].address])
         replaced = bc.replace_chain([b.to_dict() for b in short.chain])
         assert not replaced
 
     def test_mine_empty_mempool_raises(self, bc, wallets):
         with pytest.raises(ValueError):
             bc.mine_pending_transactions(wallets[0].address)
+
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+
+class TestPersistence:
+    def test_save_load_round_trip(self, bc, signed_tx, wallets, tmp_path):
+        bc.add_transaction(signed_tx)
+        bc.mine_pending_transactions(wallets[0].address)
+        path = str(tmp_path / "chain.json")
+        bc.save(path)
+
+        restored = Blockchain.load(path)
+        assert restored.height == bc.height
+        assert restored.chain[0].hash == bc.chain[0].hash
+        assert restored.last_block.hash == bc.last_block.hash
+        assert restored.is_chain_valid()
+
+    def test_custody_survives_restart(self, bc, signed_tx, wallets, tmp_path):
+        """Balances are re-derived from the reloaded chain, not stored."""
+        bc.add_transaction(signed_tx)
+        bc.mine_pending_transactions(wallets[0].address)
+        path = str(tmp_path / "chain.json")
+        bc.save(path)
+
+        restored = Blockchain.load(path)
+        assert restored.custody_state().balance_of(
+            wallets[1].address, "crude_oil"
+        ) == 1000
+
+    def test_registry_survives_restart(self, bc, wallets, tmp_path):
+        path = str(tmp_path / "chain.json")
+        bc.save(path)
+        assert Blockchain.load(path).authorized_producers == {wallets[0].address}
+
+    def test_mempool_is_persisted(self, bc, signed_tx, tmp_path):
+        bc.add_transaction(signed_tx)
+        path = str(tmp_path / "chain.json")
+        bc.save(path)
+        assert len(Blockchain.load(path).mempool) == 1
+
+    def test_tampered_file_is_rejected_on_load(self, bc, signed_tx, wallets, tmp_path):
+        """A hand-edited ledger file must not be silently trusted."""
+        bc.add_transaction(signed_tx)
+        bc.mine_pending_transactions(wallets[0].address)
+        path = str(tmp_path / "chain.json")
+        bc.save(path)
+
+        with open(path) as f:
+            payload = json.load(f)
+        payload["chain"][1]["transactions"][0]["quantity_litres"] = 999_999
+        with open(path, "w") as f:
+            json.dump(payload, f)
+
+        with pytest.raises(ValueError):
+            Blockchain.load(path)
+
+    def test_save_is_atomic_leaves_no_temp_file(self, bc, tmp_path):
+        path = str(tmp_path / "chain.json")
+        bc.save(path)
+        assert not os.path.exists(f"{path}.tmp")
